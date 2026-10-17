@@ -1,3 +1,6 @@
 .venv/
 __pycache__/
+*.wav
+!samples/*.wav
 .env
+reports/
