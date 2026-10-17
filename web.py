@@ -1,6 +1,7 @@
 # Web alert screen for Kavach: big, projector-friendly, served only to this laptop.
 # kavach.py --web starts it on http://localhost:8000
 #   GET  /state  current call state (the page polls it twice a second)
+#   POST /start  start a new call (listen to the mic, or play the demo file)
 #   POST /end    end the call, which triggers the after-call report
 #   POST /ask    {"q": "..."} -> chat answer about the call
 
@@ -27,9 +28,13 @@ PAGE = r"""<!doctype html>
   #banner { border-radius:16px; padding:30px 32px; font-size:36px; font-weight:800; background:var(--safe);
             transition:background .3s; line-height:1.2 }
   #banner small { display:block; font-size:18px; font-weight:500; margin-top:8px; opacity:.9 }
+  #banner.idle { background:var(--line) }
   #banner.warn { background:var(--warn); color:#141414 }
   #banner.scam { background:var(--scam); animation:pulse 1s infinite }
   @keyframes pulse { 50% { filter:brightness(1.3) } }
+  .controls { display:flex; gap:12px; margin-top:14px }
+  .controls button { padding:14px 28px; font-size:20px; border-radius:12px }
+  #start { background:#3ddc84; color:#0b2416 } #stop { background:#ff5a5a; color:#2a0909 }
   .meter { height:14px; background:var(--line); border-radius:7px; margin:16px 0 6px; overflow:hidden }
   .meter div { height:100%; width:0; background:var(--text); transition:width .5s }
   .grid { display:grid; grid-template-columns:1fr 1fr; gap:16px; margin-top:18px }
@@ -61,14 +66,16 @@ PAGE = r"""<!doctype html>
   <div class="pills"><span id="live" class="pill live"><span class="dot"></span><span id="livetxt">listening</span></span>
     <span id="net" class="pill"><span class="dot"></span><span id="nettxt">offline</span></span></div>
 </header>
-<div id="banner">Listening… no scam signs yet</div>
+<div id="banner" class="idle">Ready<small>Press Start when the call begins.</small></div>
+<div class="controls"><button id="start" onclick="startCall()">▶ Start call</button>
+  <button id="stop" onclick="endCall()" disabled>■ End call</button></div>
 <div class="meter"><div id="bar"></div></div><div class="sub">risk <b id="risk">0</b> / 100</div>
 <div class="grid">
   <div class="card"><h2>Signals heard</h2><div id="hits" class="empty">none yet</div></div>
   <div class="card"><h2>Local AI <span id="aims"></span></h2><div id="ai" class="empty">waiting for enough speech…</div></div>
   <div class="card wide"><h2>Live transcript</h2><div id="transcript" class="empty">…</div></div>
-  <div class="card wide"><h2>After-call report <button id="end" onclick="endCall()">End call</button></h2>
-    <div id="report" class="empty">Press “End call” when the call is over.</div></div>
+  <div class="card wide"><h2>After-call report</h2>
+    <div id="report" class="empty">Appears when you end a suspicious call.</div></div>
   <div class="card wide"><h2>Ask about this call</h2>
     <div class="chips">
       <button class="chip" onclick="ask(this.textContent)">Was this really the police?</button>
@@ -85,14 +92,19 @@ const LABEL = {
   safe: ["✓ No scam signs", "Kavach is listening to the call."],
   warn: ["! Suspicious call", "Be careful. Don't send money or share any code yet."],
   scam: ["⚠ SCAM LIKELY: hang up", "Don't share OTP. Don't send money. Real police never call like this."] };
-let lastLines = 0;
+let lastLines = 0, callId = null;
 async function tick() {
   try {
     const s = await (await fetch('/state')).json();
-    const [t, sub] = LABEL[s.level];
-    $('banner').className = s.level; $('banner').innerHTML = `${t}<small>${sub}</small>`;
+    if (s.id !== callId) { callId = s.id; $('msgs').innerHTML = ''; resetCards(); }
+    const [t, sub] = s.idle ? ["Ready", "Press Start when the call begins."] : LABEL[s.level];
+    $('banner').className = s.idle ? 'idle' : s.level; $('banner').innerHTML = `${t}<small>${sub}</small>`;
+    const busy = !s.ended || (s.reporting && !s.report);
+    $('start').disabled = busy; $('stop').disabled = s.ended;
+    $('start').textContent = s.idle ? '▶ Start call' : '▶ New call';
     $('risk').textContent = s.risk; $('bar').style.width = s.risk + '%';
-    $('live').className = 'pill' + (s.ended ? '' : ' live'); $('livetxt').textContent = s.ended ? 'call ended' : 'listening';
+    $('live').className = 'pill' + (s.ended ? '' : ' live');
+    $('livetxt').textContent = s.idle ? 'ready' : s.ended ? 'call ended' : 'listening';
     $('net').className = 'pill' + (s.online ? ' on' : ''); $('nettxt').textContent = s.online ? 'Gemma 4 online' : 'offline · local AI';
     const hits = Object.entries(s.hits);
     $('hits').className = hits.length ? '' : 'empty';
@@ -108,11 +120,15 @@ async function tick() {
     if (s.report) { $('report').className = '';
       $('report').innerHTML = `<div class="who">${esc(s.report.who)} · ${s.report.secs}s</div>${esc(s.report.text)}`; }
     else if (s.reporting) $('report').textContent = 'Writing the report…';
-    else if (s.ended) $('report').textContent = 'No report needed: this call looked safe.';
-    $('end').disabled = s.ended;
+    else if (s.ended && !s.idle) $('report').textContent = 'No report needed: this call looked safe.';
   } catch (e) {}
 }
-function endCall() { $('end').disabled = true; fetch('/end', {method:'POST'}); }
+function resetCards() {
+  $('ai').className = 'empty'; $('ai').textContent = 'waiting for enough speech…'; $('aims').textContent = '';
+  $('report').className = 'empty'; $('report').textContent = 'Appears when you end a suspicious call.';
+}
+function startCall() { $('start').disabled = true; fetch('/start', {method:'POST'}); }
+function endCall() { $('stop').disabled = true; fetch('/end', {method:'POST'}); }
 async function ask(q) {
   q = q.trim(); if (!q) return;
   const box = $('msgs');
@@ -130,9 +146,9 @@ setInterval(tick, 500); tick();
 </script></body></html>"""
 
 
-def serve(snapshot, end, ask, port=8000):
-    """Serve the page in a background thread.
-    snapshot() -> state dict, end() ends the call, ask(question) -> {"who", "text", "secs"}."""
+def serve(snapshot, start, end, ask, port=8000):
+    """Serve the page in a background thread. snapshot() -> state dict, start() / end() control the
+    call, ask(question) -> {"who", "text", "secs"}."""
 
     class Handler(BaseHTTPRequestHandler):
         def do_GET(self):
@@ -142,8 +158,8 @@ def serve(snapshot, end, ask, port=8000):
                 self._send(200, "text/html; charset=utf-8", PAGE)
 
         def do_POST(self):
-            if self.path == "/end":
-                end()
+            if self.path in ("/start", "/end"):
+                (start if self.path == "/start" else end)()
                 self._send(204, "text/plain", "")
             elif self.path == "/ask":
                 length = int(self.headers.get("Content-Length", 0))

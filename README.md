@@ -60,9 +60,9 @@ ollama pull llama3.2:3b
 echo "GEMINI_API_KEY=your-key" > .env      # optional: Gemma 4 reports and chat
 
 ./kavach check    # is everything ready?
-./kavach          # live: put the call on speaker, the page opens at http://localhost:8000
-./kavach demo     # replay a sample scam call
-./kavach safe     # replay a normal call
+./kavach          # live: the page opens at http://localhost:8000, press Start, put the call on speaker
+./kavach demo     # same page, Start replays a sample scam call
+./kavach safe     # same page, Start replays a normal call
 ```
 
 ## Stack

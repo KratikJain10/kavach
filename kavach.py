@@ -2,7 +2,8 @@
 # Kavach: offline scam-call guard.
 #   live:   python kavach.py                       (call on speaker next to the laptop)
 #   replay: python kavach.py --file samples/scam_hi.wav --play
-#   add --web for the alert page at http://localhost:8000 (--open also opens the browser)
+#   add --web for the alert page at http://localhost:8000 (--open also opens the browser);
+#   the page has Start / End call buttons, so several calls can be shown in one session
 #
 # audio -> transcribe.py (whisper.cpp) -> rules.py (instant) + llm.py (every few seconds)
 #       -> risk score -> red alert on screen + spoken Hindi warning
@@ -32,12 +33,14 @@ SCAM_AT = 60        # risk >= this: red alert + spoken warning
 SUSPICIOUS_AT = 30  # risk >= this: yellow
 LLM_EVERY = 4       # seconds between LLM checks
 LLM_WINDOW = 600    # characters of recent transcript the LLM sees
+ONLINE = [False]    # can we reach the Gemini API right now? (only for the page's status pill)
 
 
 class Call:
     """Everything known about the call so far. Shared by the audio, LLM and screen threads."""
 
     def __init__(self):
+        self.id = time.time()   # lets the page notice a new call and clear its chat
         self.lock = threading.Lock()
         self.lines = []      # finished transcript lines
         self.partial = ""    # line still being transcribed
@@ -49,7 +52,6 @@ class Call:
         self.reporting = False
         self.report = None      # (who, text, seconds) once the after-call report is written
         self.chat = []          # (question, answer) pairs from the page
-        self.online = False     # can we reach the Gemini API right now?
 
     def text(self):
         return " ".join(self.lines + [self.partial]).strip()
@@ -74,7 +76,7 @@ class Call:
             who, text, secs = self.report or (None, None, None)
             return {"risk": self.risk(), "level": self.level(), "hits": self.hits, "ai": self.ai,
                     "lines": self.lines[-12:], "partial": self.partial, "ended": self.done,
-                    "reporting": self.reporting, "online": self.online,
+                    "reporting": self.reporting, "online": ONLINE[0], "idle": False, "id": self.id,
                     "report": {"who": who, "text": text, "secs": secs} if self.report else None}
 
     def ask(self, question):
@@ -112,16 +114,16 @@ def ai_loop(call):
                 call.ai, call.ai_text = verdict, text
 
 
-def net_loop(call):
+def net_loop():
     # Only for the status pill on the page; the guard itself never needs the internet.
     while True:
         try:
             urllib.request.urlopen("https://generativelanguage.googleapis.com", timeout=3)
-            call.online = True
+            ONLINE[0] = True
         except urllib.error.HTTPError:
-            call.online = True   # any HTTP answer means we are online
+            ONLINE[0] = True   # any HTTP answer means we are online
         except Exception:
-            call.online = False
+            ONLINE[0] = False
         time.sleep(10)
 
 
@@ -174,6 +176,58 @@ def draw(call):
     sys.stdout.flush()
 
 
+def run_call(call, args, warning, tick=lambda: None):
+    """One call from start to finish: audio, LLM checks, alert, then the report."""
+    if args.file:
+        src = threading.Thread(target=transcribe.from_file, args=(args.file, call.on_text, args.play))
+    else:
+        src = threading.Thread(target=transcribe.live, args=(call.on_text, lambda: call.done, args.stream))
+    src.daemon = True
+    src.start()
+    threading.Thread(target=ai_loop, args=(call,), daemon=True).start()
+    while src.is_alive() and not call.done:
+        tick()
+        with call.lock:
+            fire = call.risk() >= SCAM_AT and not call.alerted
+            call.alerted |= fire
+        if fire:
+            threading.Thread(target=speak, args=(warning,), daemon=True).start()
+        time.sleep(0.4)
+    if not call.done:
+        # a replay ended by itself: give the LLM up to 20 s to judge the whole call
+        with call.lock:
+            full = call.text()[-LLM_WINDOW:]
+        for _ in range(50):
+            with call.lock:
+                if call.ai_text == full:
+                    break
+            time.sleep(0.4)
+    call.done = True
+    tick()
+    finish(call)
+
+
+def finish(call):
+    risk = call.risk()
+    print(f"\n{DIM}Call ended. Final risk {risk}.{RST}")
+    if risk < SUSPICIOUS_AT:
+        return
+    print(f"{BOLD}Writing the after-call report…{RST}")
+    call.reporting = True
+    who, text, secs = gemma.report(call.text(), call.hits)
+    call.report = (who, text, secs)
+    print(f"\n{BOLD}📋 Report{RST} {DIM}({who}, {secs}s){RST}\n{text}\n")
+    os.makedirs(f"{HERE}/reports", exist_ok=True)
+    path = time.strftime(f"{HERE}/reports/call-%H%M%S.txt")
+    with open(path, "w") as f:
+        f.write(f"Risk {risk}\nSignals: {call.hits}\n\nTranscript:\n{call.text()}\n\n{who}:\n{text}\n")
+    print(f"{DIM}saved {path}{RST}")
+
+
+IDLE = {"idle": True, "id": 0, "risk": 0, "level": "safe", "hits": {}, "ai": None, "lines": [],
+        "partial": "", "ended": True, "reporting": False, "report": None}
+
+
 def main():
     ap = argparse.ArgumentParser(description="Kavach: offline scam-call guard")
     ap.add_argument("--file", help="replay a 16 kHz mono wav instead of listening to the mic")
@@ -185,69 +239,54 @@ def main():
     args = ap.parse_args()
 
     print("Loading…")
-    call = Call()
     warning = None if args.quiet else load_warning()
-    if args.file:
-        src = threading.Thread(target=transcribe.from_file, args=(args.file, call.on_text, args.play))
-    else:
-        src = threading.Thread(target=transcribe.live, args=(call.on_text, lambda: call.done, args.stream))
-    src.daemon = True
-    src.start()
-    threading.Thread(target=ai_loop, args=(call,), daemon=True).start()
-    if args.web:
-        def end():
-            call.done = True
-        web.serve(call.snapshot, end, call.ask)
-        threading.Thread(target=net_loop, args=(call,), daemon=True).start()
-        if args.open:
-            subprocess.Popen(["xdg-open", "http://localhost:8000"], stdout=subprocess.DEVNULL,
-                             stderr=subprocess.DEVNULL)
+    if not args.file:
+        transcribe.warm_up()  # load whisper now so the call starts instantly
 
-    try:
-        while src.is_alive() and not call.done:
-            if args.web:
-                print(f"\r{DIM}alert page: http://localhost:8000 · risk {call.risk():3d}{RST}", end="", flush=True)
-            else:
-                draw(call)
-            with call.lock:
-                fire = call.risk() >= SCAM_AT and not call.alerted
-                call.alerted |= fire
-            if fire:
-                threading.Thread(target=speak, args=(warning,), daemon=True).start()
-            time.sleep(0.4)
-        # replay ended: give the LLM up to 20 s to judge the whole call
-        with call.lock:
-            full = call.text()[-LLM_WINDOW:]
-        for _ in range(50 if not call.done else 0):
-            with call.lock:
-                if call.ai_text == full:
-                    break
-            time.sleep(0.4)
-        if not args.web:
-            draw(call)
-    except KeyboardInterrupt:
-        pass
-    call.done = True
-    risk = call.risk()
-    print(f"\n{DIM}Call ended. Final risk {risk}.{RST}")
-    if risk >= SUSPICIOUS_AT:
-        print(f"\n{BOLD}Writing the after-call report…{RST}")
-        call.reporting = True
-        who, text, secs = gemma.report(call.text(), call.hits)
-        call.report = (who, text, secs)
-        print(f"\n{BOLD}📋 Report{RST} {DIM}({who}, {secs}s){RST}\n{text}\n")
-        os.makedirs(f"{HERE}/reports", exist_ok=True)
-        path = time.strftime(f"{HERE}/reports/call-%H%M%S.txt")
-        with open(path, "w") as f:
-            f.write(f"Risk {risk}\nSignals: {call.hits}\n\nTranscript:\n{call.text()}\n\n{who}:\n{text}\n")
-        print(f"{DIM}saved {path}{RST}")
-    if args.web:
-        print(f"{DIM}page stays up for questions at http://localhost:8000 · Ctrl+C to quit{RST}")
+    if not args.web:  # terminal only: one call, then exit
+        call = Call()
         try:
-            while True:
-                time.sleep(1)
+            run_call(call, args, warning, tick=lambda: draw(call))
         except KeyboardInterrupt:
-            pass
+            call.done = True
+            finish(call)
+        return
+
+    current = [None]  # the call on screen (None until Start is pressed)
+    lock = threading.Lock()
+
+    def start():
+        with lock:
+            c = current[0]
+            if c and (not c.done or c.reporting and not c.report):
+                return  # a call (or its report) is still running
+            current[0] = Call()
+            threading.Thread(target=run_call, args=(current[0], args, warning), daemon=True).start()
+
+    def end():
+        if current[0]:
+            current[0].done = True
+
+    def snapshot():
+        c = current[0]
+        return c.snapshot() if c else dict(IDLE, online=ONLINE[0])
+
+    def ask(q):
+        c = current[0] or Call()
+        return c.ask(q)
+
+    web.serve(snapshot, start, end, ask)
+    threading.Thread(target=net_loop, daemon=True).start()
+    print(f"{BOLD}Ready:{RST} http://localhost:8000 · press Start on the page · Ctrl+C to quit")
+    if args.open:
+        subprocess.Popen(["xdg-open", "http://localhost:8000"], stdout=subprocess.DEVNULL,
+                         stderr=subprocess.DEVNULL)
+    try:
+        while True:
+            time.sleep(1)
+    except KeyboardInterrupt:
+        end()
+        print()
 
 
 if __name__ == "__main__":

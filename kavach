@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # One command to run Kavach.
-#   ./kavach          listen to a live call (put the phone on speaker next to the laptop)
-#   ./kavach demo     replay the sample scam call, with sound
-#   ./kavach safe     replay a normal call from mom, with sound
+#   ./kavach          live: the page opens, press Start, put the phone on speaker next to the laptop
+#   ./kavach demo     same page, Start plays the sample scam call
+#   ./kavach safe     same page, Start plays a normal call from mom
 #   ./kavach check    check that everything is ready
 cd "$(dirname "$0")" || exit 1
 PY=.venv/bin/python
@@ -33,6 +33,7 @@ case "${1:-live}" in
   live)  ARGS=() ;;
   *)     sed -n '2,6p' "$0"; exit 1 ;;
 esac
+pkill -f 'whisper-server.*--port 8178' 2>/dev/null  # a leftover from a crashed run would hold GPU memory
 check >/dev/null || { check; exit 1; }
 # load the local model onto the GPU now so the first verdict is quick
 curl -s localhost:11434/api/generate -d '{"model":"llama3.2:3b","keep_alive":"30m","options":{"num_ctx":2048}}' >/dev/null

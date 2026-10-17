@@ -6,6 +6,7 @@
 # Every source calls on_text(line, finished): finished=False while a sentence is still being spoken.
 
 import array
+import atexit
 import io
 import json
 import math
@@ -45,6 +46,17 @@ def is_junk(line):
 
 
 # ── whisper-server: keeps the model loaded so each sentence takes ~1 s ───────────
+_server = None
+
+
+def warm_up():
+    """Start whisper-server once (it stays loaded for every call) and stop it when Kavach exits."""
+    global _server
+    if _server is None or _server.poll() is not None:
+        _server = _start_server()
+        atexit.register(_server.terminate)
+
+
 def _start_server():
     base = [f"{WHISPER_DIR}/build/bin/whisper-server", "-m", WHISPER_MODEL, "-l", LANG, "-t", "6",
             "-bs", "1", "-nt", "--prompt", HINT, "--port", str(SERVER_PORT)]
@@ -101,7 +113,7 @@ def _rms(frame):
 # ── live: sentence by sentence ──────────────────────────────────────────────────
 def live(on_text, stop=lambda: False, wav_path=None):
     """Listen to the mic (or replay wav_path at real speed through the same pipeline)."""
-    server = _start_server()
+    warm_up()
     frames = queue.Queue()
     reader = _wav_reader if wav_path else _mic_reader
     threading.Thread(target=reader, args=(frames, stop, wav_path), daemon=True).start()
@@ -110,38 +122,35 @@ def live(on_text, stop=lambda: False, wav_path=None):
     sentence, pre = [], []
     silent = spoken = 0.0
     last_preview = time.time()
-    try:
-        while not stop():
-            try:
-                f = frames.get(timeout=1)
-            except queue.Empty:
-                continue
-            if f is None:  # end of the wav file
-                break
-            level = _rms(f)
-            talking = level > max(noise * 2.5, 250)
-            if not talking:
-                noise = 0.95 * noise + 0.05 * level  # learn the room's noise from quiet moments
-            if not sentence:
-                pre = (pre + [f])[-10:]  # keep 300 ms before speech starts so the first word isn't cut
-                if talking:
-                    sentence, silent, spoken = pre + [f], 0.0, 0.03
-                continue
-            sentence.append(f)
-            silent = 0.0 if talking else silent + 0.03
-            spoken += 0.03 if talking else 0
-            length = len(sentence) * 0.03
-            if silent >= END_SILENCE or length >= MAX_SENTENCE:
-                if spoken > 0.4:  # ignore clicks and coughs
-                    _emit(on_text, _transcribe(_louder(b"".join(sentence))), True)
-                sentence, pre = [], []
-            elif length > 1.5 and time.time() - last_preview > PREVIEW_EVERY:
-                last_preview = time.time()
-                _emit(on_text, _transcribe(_louder(b"".join(sentence))), False)
-        if sentence and spoken > 0.4:
-            _emit(on_text, _transcribe(_louder(b"".join(sentence))), True)
-    finally:
-        server.terminate()
+    while not stop():
+        try:
+            f = frames.get(timeout=1)
+        except queue.Empty:
+            continue
+        if f is None:  # end of the wav file
+            break
+        level = _rms(f)
+        talking = level > max(noise * 2.5, 250)
+        if not talking:
+            noise = 0.95 * noise + 0.05 * level  # learn the room's noise from quiet moments
+        if not sentence:
+            pre = (pre + [f])[-10:]  # keep 300 ms before speech starts so the first word isn't cut
+            if talking:
+                sentence, silent, spoken = pre + [f], 0.0, 0.03
+            continue
+        sentence.append(f)
+        silent = 0.0 if talking else silent + 0.03
+        spoken += 0.03 if talking else 0
+        length = len(sentence) * 0.03
+        if silent >= END_SILENCE or length >= MAX_SENTENCE:
+            if spoken > 0.4:  # ignore clicks and coughs
+                _emit(on_text, _transcribe(_louder(b"".join(sentence))), True)
+            sentence, pre = [], []
+        elif length > 1.5 and time.time() - last_preview > PREVIEW_EVERY:
+            last_preview = time.time()
+            _emit(on_text, _transcribe(_louder(b"".join(sentence))), False)
+    if sentence and spoken > 0.4:
+        _emit(on_text, _transcribe(_louder(b"".join(sentence))), True)
 
 
 def _mic_reader(frames, stop, _):
