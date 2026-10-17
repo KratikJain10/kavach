@@ -1,0 +1,39 @@
+#!/usr/bin/env bash
+# One command to run Kavach.
+#   ./kavach          listen to a live call (put the phone on speaker next to the laptop)
+#   ./kavach demo     replay the sample scam call, with sound
+#   ./kavach safe     replay a normal call from mom, with sound
+#   ./kavach check    check that everything is ready
+cd "$(dirname "$0")" || exit 1
+PY=.venv/bin/python
+W=${WHISPER_DIR:-$HOME/whisper.cpp}
+
+ok()   { printf '  \e[32m✓\e[0m %s\n' "$1"; }
+fail() { printf '  \e[31m✗\e[0m %s\n' "$1"; }
+
+check() {
+  local bad=0
+  [ -x "$PY" ] && "$PY" -c 'import piper' 2>/dev/null && ok "python venv" || { fail "python venv: python -m venv .venv && .venv/bin/pip install piper-tts"; bad=1; }
+  [ -x "$W/build/bin/whisper-stream" ] && ok "whisper.cpp" || { fail "whisper.cpp not built in $W"; bad=1; }
+  [ -s "$W/models/ggml-large-v3-turbo-q5_0.bin" ] && ok "whisper model" || { fail "run: cd $W && sh models/download-ggml-model.sh large-v3-turbo-q5_0"; bad=1; }
+  curl -s -m 2 localhost:11434 >/dev/null && ok "ollama running" || { fail "ollama not running: sudo systemctl start ollama"; bad=1; }
+  ollama list 2>/dev/null | grep -q llama3.2:3b && ok "llama3.2:3b" || { fail "run: ollama pull llama3.2:3b"; bad=1; }
+  [ -s "$HOME/.local/share/kavach/hi_IN-priyamvada-medium.onnx" ] && ok "Hindi warning voice" || fail "warning voice missing (Kavach still works, silently)"
+  grep -q '^GEMINI_API_KEY=.' .env 2>/dev/null && ok "Gemini key (Gemma 4 reports)" || fail "no GEMINI_API_KEY in .env (reports use the local model)"
+  curl -s -m 3 -o /dev/null https://generativelanguage.googleapis.com && ok "online" || fail "offline (fine: only Gemma 4 needs internet)"
+  ! curl -s -m 1 localhost:8000 >/dev/null && ok "port 8000 free" || { fail "port 8000 busy: another Kavach is running? (pkill -f kavach.py)"; bad=1; }
+  return $bad
+}
+
+echo "🛡  Kavach"
+case "${1:-live}" in
+  check) check; exit $? ;;
+  demo)  ARGS=(--file samples/scam_hi.wav --play) ;;
+  safe)  ARGS=(--file samples/safe_hi.wav --play) ;;
+  live)  ARGS=() ;;
+  *)     sed -n '2,6p' "$0"; exit 1 ;;
+esac
+check >/dev/null || { check; exit 1; }
+# load the local model onto the GPU now so the first verdict is quick
+curl -s localhost:11434/api/generate -d '{"model":"llama3.2:3b","keep_alive":"30m","options":{"num_ctx":2048}}' >/dev/null
+exec "$PY" kavach.py --web --open "${ARGS[@]}"
